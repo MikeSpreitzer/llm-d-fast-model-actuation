@@ -223,7 +223,9 @@ The mutable internal state of the controller includes the following.
 
 - For each (relevant Node, accelerator):
 
-    - the amount of accelerator memory currently in use;
+    - the total amount of accelerator memory currently in use, which
+      comes (in the case of nvidia GPU operator) from monitoring the
+      Prometheus metric named `DCGM_FI_DEV_FB_USED`;
 
     - the latest time when a vLLM instance using that accelerator went
       to sleep.
@@ -254,11 +256,13 @@ an existing vLLM instance, it is time to do something about that. If
 there is a sleeping vLLM instance on the right Node and accelerator
 set, then it is woken and bound to the server-requesting
 Pod. Otherwise it is necessary to make a new vLLM instance (on that
-Node, using the already-chosen set of accelerators). We presume that
-the Kubernetes scheduler has already assured that there is no awake
+Node, using the already-chosen set of accelerators). The Kubernetes
+scheduler and kubelet have already assured that there is no other
+server-requesting Pod using any of those accelerators, and the
+behavior of this controller means that consequently there is no awake
 vLLM instance using any of those accelerators. But the controller must
 not bust the accelerator memory budget. The controller checks that on
-each of the new vLLM instance's accelerators: the amount of
+each of the new vLLM instance's accelerators: the total amount of
 accelerator memory in use does not exceed the budget for sleeping vLLM
 instances; this check is done now (rather than when a vLLM instance is
 put to sleep) so that this budget can be temporarily exceeded while
@@ -267,7 +271,7 @@ exceeded on any accelerator _and_ the last sleep time for that
 accelerator is older than a configured threshold, a sleeping vLLM
 instance using that accelerator is deleted; this is done by deleting
 the server-running Pod of that vLLM instance.  The possibility of one
-vLLM instance using multiple acclerators means that this decision is
+vLLM instance using multiple accelerators means that this decision is
 not made independently for each accelerator. The controller chooses a
 set of sleeping vLLM instances that covers the set of accelerators
 that need a vLLM instance deletion. The choice is made with preference

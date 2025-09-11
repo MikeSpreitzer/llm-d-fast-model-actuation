@@ -200,3 +200,77 @@ The key steps for requesting an inference server are:
 ### Inference Server Deletion Flow
 
 TDB.
+
+## Dual-pod controller logic
+
+This section is about the controller that manages sleep/wake only.
+
+The mutable internal state of the controller includes the following.
+
+- The set of Nodes that this controller can use for server-running
+  Pods. This is maintained by monitoring the taint that keeps other
+  accelerator-using workloads off of these Nodes.
+
+- For each relevant Node, the type of the accelerators (they are
+  assumed to all be of the same type). This is maintained by looking
+  at the Node label that conveys this information.
+
+- For each relevant Node, the set of accelerator IDs. This is
+  accumulated from responses to the query to stubs that returns the
+  set of assigned accelerators.
+
+- A set of existing vLLM instances. Each is asleep or awake. Each runs
+  a particular model, with other command line parameters. Each is in a
+  Pod, on one Node, and uses a set of particular accelerators on that
+  Node. Each sleeping vLLM instance: (a) has a timestamp indicating
+  when it went to sleep and (b) is using a known amount of memory of
+  each of those accelerators
+
+- A set of server-running Pods. Each is running one of the
+  aforementioned vLLM instances.
+
+- A set of server-requesting Pods that are bound to Nodes. Each such
+  Pod specifies: model, other command-line parameters, and a
+  Node. After its stub has been queried, this Pod is also known to
+  specify a particular set of accelerators on the Node. This
+  sever-requesting Pod may be bound (here, in this data structure) to
+  a vLLM instance.
+
+- An index into the above information that reveals, for each (Node,
+  accelerator): (a) whether there is an awake vLLM instance, (b) the
+  amount of accelerator memory used by sleeping instances.
+
+When a new server-requesting Pod starts running, the controller
+queries the stub in that Pod to get the set of assigned
+accelerators.
+
+When there is a server-requesting Pod that has a known set of
+accelerators but is not bound (in the controller's internal state) to
+an existing vLLM instance, it is time to do something about that. If
+there is a sleeping vLLM instance on the right Node and accelerator
+set, then it is woken and bound to the server-requesting
+Pod. Otherwise it is necessary to make a new vLLM instance (on that
+Node, using the already-chosen set of accelerators). We presume that
+the Kubernetes scheduler has already assured that there is no awake
+vLLM instance using any of those accelerators. But the controller must
+not bust the accelerator memory budget. The controller checks that on
+each of the accelerators, the amount of memory used by sleeping vLLM
+instances does not exceed the budget for that; this check is done now
+(rather than when a vLLM instance is put to sleep) so that this budget
+can be temporarily exceeded while there are no awake instances using
+that accelerator. If the budget is exceeded on any accelerator, a
+sleeping vLLM instance using that accelerator is deleted; this is done
+by deleting the server-running Pod of that vLLM instance.  The
+possibility of one vLLM instance using multiple acclerators means that
+this decision is not made independently for each accelerator. The
+controller chooses a set of sleeping vLLM instances that covers the
+set of accelerators whose memory budget is exceeded. The choice is
+made with preference for deleting less recently used vLLM instances.
+Once the memory budget on each of the accelerators is respected, the
+new vLLM instance is created. That is done by creating a new
+server-running Pod.
+
+Note that this design is centered on vLLM instances rather than
+server-running Pods. That makes it easy to adapt in the future when
+one server-running Pod can have multiple vLLM instances (several
+sleeping and maybe one awake).

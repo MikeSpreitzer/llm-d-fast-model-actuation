@@ -221,7 +221,7 @@ The mutable internal state of the controller includes the following.
   time series that report on the current memory usage on an
   accelerator.
 
-- For each (relevant Node, accelerator):
+- For each accelerator on a relevant Node:
 
     - the total amount of accelerator memory currently in use, which
       comes (in the case of nvidia GPU operator) from monitoring the
@@ -246,17 +246,28 @@ The mutable internal state of the controller includes the following.
   sever-requesting Pod may be bound (here, in this data structure) to
   a vLLM instance.
 
-When a new server-requesting Pod starts running, the controller
-queries the stub in that Pod to get the set of assigned
-accelerators.
+When, for a given server-requesting Pod, (a) the assigned set of
+accelerators is not known and (b) the stub container is running
+(without regard to whether the container is marked as "ready"), the
+dual-pod controller tries until successful to query for the set of
+assigned accelerators.
 
 When there is a server-requesting Pod that has a known set of
 accelerators but is not bound (in the controller's internal state) to
-an existing vLLM instance, it is time to do something about that. If
-there is a sleeping vLLM instance on the right Node and accelerator
-set, then it is woken and bound to the server-requesting
-Pod. Otherwise it is necessary to make a new vLLM instance (on that
-Node, using the already-chosen set of accelerators). The Kubernetes
+an existing vLLM instance, it is time to do something about
+that. There are two cases: waking a sleeping vLLM instance and
+creating a new vLLM instance.
+
+A sleeping vLLM instance is woken if there is one that is on the right
+Node and has the same command line and environment variable settings
+(which include one that identifies the assigned accelerators). The
+controller makes the request to wake that instance, and upon positive
+response makes the association in the controller's internal data
+structure. The controller also completes the setup of the readiness
+relay, as mentioned below.
+
+Otherwise it is necessary to make a new vLLM instance (on that Node,
+using the already-chosen set of accelerators). The Kubernetes
 scheduler and kubelet have already assured that there is no other
 server-requesting Pod using any of those accelerators, and the
 behavior of this controller means that consequently there is no awake
@@ -264,11 +275,20 @@ vLLM instance using any of those accelerators. But the controller must
 not bust the accelerator memory budget. The controller checks that on
 each of the new vLLM instance's accelerators: the total amount of
 accelerator memory in use does not exceed the budget for sleeping vLLM
-instances; this check is done now (rather than when a vLLM instance is
+instances. This check is done now (rather than when a vLLM instance is
 put to sleep) so that this budget can be temporarily exceeded while
-there are no awake instances using that accelerator. If the budget is
-exceeded on any accelerator _and_ the last sleep time for that
-accelerator is older than a configured threshold, a sleeping vLLM
+there are no awake instances using that accelerator. The controller
+deletes sleeping vLLM instances that use the assigned accelerator(s)
+if necessary to respect that budget; see details below. Once the
+memory budget on each of the accelerators is respected, the new vLLM
+instance is created. That is done by creating a new server-running Pod
+and setting up the relay of its readiness to the server-requesting
+Pod's inference-server container.
+
+The way that the memory budget is respected is as follows. If the
+budget is exceeded on any accelerator _and_ the last sleep time for
+that accelerator is older than a configured threshold (which is there
+to account for the latency through Prometheus), a sleeping vLLM
 instance using that accelerator is deleted; this is done by deleting
 the server-running Pod of that vLLM instance.  The possibility of one
 vLLM instance using multiple accelerators means that this decision is
@@ -277,9 +297,31 @@ set of sleeping vLLM instances that covers the set of accelerators
 that need a vLLM instance deletion. The choice is made with preference
 for both (a) not deleting vLLM instances using accelerators that are
 meeting their memory budget and (b) deleting less recently used vLLM
-instances.  Once the memory budget on each of the accelerators is
-respected, the new vLLM instance is created. That is done by creating
-a new server-running Pod.
+instances.
+
+The relay of readiness goes as follows.
+
+    - The stub in the server-requesting pod can be sent an HTTP POST
+      request that conveys the (in-cluster) IP of the server-running
+      Pod.
+
+    - Once given that IP, the stub aggressively polls (directly, not
+      by querying the kube-apiserver) the server-running Pod's
+      inference-server container for readiness. Once a positive answer
+      is returned, the stub itself responds positively to readiness
+      requests on itself.
+
+    - After the dual-pod controller creates a server-running Pod, the
+      controller waits for the IP address of the server-running Pod to
+      be defined.
+
+    - Once the controller knows the IP address of the server-running
+      Pod, it makes the POST request to the stub in the
+      server-requesting Pod to relay that IP address.
+
+    - After waking a vLLM instance, the dual-pod controller makes the
+      POST request to relay the server-running Pod's IP to the
+      corresponding server-requesting Pod's stub.
 
 Note that this design is centered on vLLM instances rather than
 server-running Pods. That makes it easy to adapt in the future when

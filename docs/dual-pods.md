@@ -85,7 +85,7 @@ spec:
             values: ["NVIDIA-A100-SXM4-80GB"]
   containers:
   - name: inference-server
-    image: some-registry/some-namespace/reverse-proxy@v0.1.0
+    image: some-registry/some-namespace/stub@v0.1.0
     command:
     - /proxy
     - --relay-port-1=8000
@@ -108,9 +108,9 @@ spec:
 
 From such a server-requesting Pod, after it is placed on the Node
 named "somenode" and started and queried to reveal that the set of
-associated GPUs is `{"3"}`, the dual-pod controller would construct
-the following to give to the kube-apiserver to create the
-server-running Pod.
+associated GPUs is `{"3"}`, the dual-pod controller that manages
+sleep/wake but not model swapping would construct the following to
+give to the kube-apiserver to create the server-running Pod.
 
 ```yaml
 apiVersion: v1
@@ -258,23 +258,21 @@ mentioned below.
 
 The relay of readiness goes as follows.
 
-    - The stub in the server-requesting pod can be sent an HTTP POST
-      request that conveys the (in-cluster) IP of the server-running
-      Pod.
+- The stub in the server-requesting pod can be sent an HTTP POST
+  request that conveys the URL to poll for readiness of the real
+  inference server container.
 
-    - Once given that IP, the stub aggressively polls (directly, not
-      by querying the kube-apiserver) the server-running Pod's
-      inference-server container for readiness. Once a positive answer
-      is returned, the stub itself responds positively to readiness
-      requests on itself.
+- Once given that URL, the stub aggressively polls it. Once a positive
+  answer is returned, the stub itself responds positively to readiness
+  requests on itself.
 
-    - After the dual-pod controller creates a server-running Pod, the
-      controller waits for the IP address of the server-running Pod to
-      be defined.
+- After the dual-pod controller creates a server-running Pod, the
+  controller waits for the IP address of the server-running Pod to be
+  defined.
 
-    - Once the controller knows the IP address of the server-running
-      Pod, it makes the POST request to the stub in the
-      server-requesting Pod to relay that IP address.
+- Once the controller knows the IP address of the server-running Pod,
+  the controller makes the POST request on the stub in the
+  server-requesting Pod to convey the URL to poll.
 
 ### Sleep/wake only
 
@@ -378,27 +376,25 @@ instances.
 
 The relay of readiness goes as follows.
 
-    - The stub in the server-requesting pod can be sent an HTTP POST
-      request that conveys the (in-cluster) IP of the server-running
-      Pod.
+- The stub in the server-requesting pod can be sent an HTTP POST
+  request that conveys the URL to poll for readiness of the real
+  inference server container.
 
-    - Once given that IP, the stub aggressively polls (directly, not
-      by querying the kube-apiserver) the server-running Pod's
-      inference-server container for readiness. Once a positive answer
-      is returned, the stub itself responds positively to readiness
-      requests on itself.
+- Once given that URL, the stub aggressively polls it. Once a positive
+  answer is returned, the stub itself responds positively to readiness
+  requests on itself.
 
-    - After the dual-pod controller creates a server-running Pod, the
-      controller waits for the IP address of the server-running Pod to
-      be defined.
+- After the dual-pod controller creates a server-running Pod, the
+  controller waits for the IP address of the server-running Pod to be
+  defined.
 
-    - Once the controller knows the IP address of the server-running
-      Pod, it makes the POST request to the stub in the
-      server-requesting Pod to relay that IP address.
+- Once the controller knows the IP address of the server-running Pod,
+  the controller makes the POST request on the stub in the
+  server-requesting Pod to convey the URL to poll.
 
-    - After waking a vLLM instance, the dual-pod controller makes the
-      POST request to relay the server-running Pod's IP to the
-      corresponding server-requesting Pod's stub.
+- After waking a vLLM instance, the dual-pod controller makes the POST
+  request to relay the server-running Pod's readinessProbe URL to the
+  corresponding server-requesting Pod.
 
 Note that this design is centered on vLLM instances rather than
 server-running Pods. That makes it easy to adapt in the future when
@@ -510,24 +506,21 @@ instances.
 
 The relay of readiness goes as follows.
 
-    - The stub in the server-requesting pod can be sent an HTTP POST
-      request that conveys the (in-cluster) IP of the server-running
-      Pod.
+- The stub in the server-requesting pod can be sent an HTTP POST
+  request that conveys the URL to poll for readiness of the real
+  inference server container.
 
-    - Once given that IP, the stub aggressively polls (directly, not
-      by querying the kube-apiserver) the server-running Pod's
-      inference-server container for readiness. Once a positive answer
-      is returned, the stub itself responds positively to readiness
-      requests on itself.
+- Once given that URL, the stub aggressively polls it. Once a positive
+  answer is returned, the stub itself responds positively to readiness
+  requests on itself.
 
-    - After the dual-pod controller makes a successful request to
-      launch a new vLLM, the controller makes the POST request to the
-      stub in the server-requesting Pod to relay the IP address of the
-      server-running Pod.
+- After the dual-pod controller makes a successful request to launch a
+  new vLLM, the controller makes the POST request to the stub in the
+  server-requesting Pod to relay the URL to poll.
 
-    - After waking a vLLM instance, the dual-pod controller makes the
-      POST request to relay the server-running Pod's IP to the
-      corresponding server-requesting Pod's stub.
+- After waking a vLLM instance, the dual-pod controller makes the POST
+  request to relay the server-running Pod's readinessProbe URL to the
+  corresponding server-requesting Pod.
 
 **NOTE**: the delta from the sleep/wake only technique is fairly
   small. The only changes from sleep/wake-only to model swapping plus

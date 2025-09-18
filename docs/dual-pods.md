@@ -262,17 +262,24 @@ The relay of readiness goes as follows.
   request that conveys the URL to poll for readiness of the real
   inference server container.
 
-- Once given that URL, the stub aggressively polls it. Once a positive
-  answer is returned, the stub itself responds positively to readiness
-  requests on itself.
+- Once given that URL, and it is not the empty string, the stub
+  aggressively polls it. Once a positive answer is returned, the stub
+  itself responds positively to readiness requests on itself.
 
-- After the dual-pod controller creates a server-running Pod, the
-  controller waits for the IP address of the server-running Pod to be
-  defined.
+- Upon being given the empty string as the URL to poll, the stub
+  starts responding negatively to readiness requests on itself.
 
-- Once the controller knows the IP address of the server-running Pod,
-  the controller makes the POST request on the stub in the
-  server-requesting Pod to convey the URL to poll.
+- If the (a) server-running Pod has an IP address, (b) the inference
+  server process is running (according to
+  ContainerStatus.State.Running), and (c) the dual-pod controller has
+  not already done so then the controller makes the POST request on
+  the stub in the server-requesting Pod to convey the URL to poll for
+  readiness.
+
+- If the inference server process has terminated, not yet restarted,
+  and the dual-pod controller has not already done so then the
+  controller makes the POST request on the stub to pass the empty
+  string as the URL to poll for readiness.
 
 ### Sleep/wake only
 
@@ -380,21 +387,24 @@ The relay of readiness goes as follows.
   request that conveys the URL to poll for readiness of the real
   inference server container.
 
-- Once given that URL, the stub aggressively polls it. Once a positive
-  answer is returned, the stub itself responds positively to readiness
-  requests on itself.
+- Once given that URL, and it is not the empty string, the stub
+  aggressively polls it. Once a positive answer is returned, the stub
+  itself responds positively to readiness requests on itself.
 
-- After the dual-pod controller creates a server-running Pod, the
-  controller waits for the IP address of the server-running Pod to be
-  defined.
+- Upon being given the empty string as the URL to poll, the stub
+  starts responding negatively to readiness requests on itself.
 
-- Once the controller knows the IP address of the server-running Pod,
-  the controller makes the POST request on the stub in the
-  server-requesting Pod to convey the URL to poll.
+- If the (a) server-running Pod has an IP address, (b) the inference
+  server process is running (according to
+  ContainerStatus.State.Running), (c) the vLLM engine is not sleeping,
+  and (d) the dual-pod controller has not already done so then the
+  controller makes the POST request on the stub in the
+  server-requesting Pod to convey the URL to poll for readiness.
 
-- After waking a vLLM instance, the dual-pod controller makes the POST
-  request to relay the server-running Pod's readinessProbe URL to the
-  corresponding server-requesting Pod.
+- If the inference server process has terminated, not yet restarted,
+  and the dual-pod controller has not already done so then the
+  controller makes the POST request on the stub to pass the empty
+  string as the URL to poll for readiness.
 
 Note that this design is centered on vLLM instances rather than
 server-running Pods. That makes it easy to adapt in the future when
@@ -510,17 +520,24 @@ The relay of readiness goes as follows.
   request that conveys the URL to poll for readiness of the real
   inference server container.
 
-- Once given that URL, the stub aggressively polls it. Once a positive
-  answer is returned, the stub itself responds positively to readiness
-  requests on itself.
+- Once given that URL, and it is not the empty string, the stub
+  aggressively polls it. Once a positive answer is returned, the stub
+  itself responds positively to readiness requests on itself.
 
-- After the dual-pod controller makes a successful request to launch a
-  new vLLM, the controller makes the POST request to the stub in the
-  server-requesting Pod to relay the URL to poll.
+- Upon being given the empty string as the URL to poll, the stub
+  starts responding negatively to readiness requests on itself.
 
-- After waking a vLLM instance, the dual-pod controller makes the POST
-  request to relay the server-running Pod's readinessProbe URL to the
-  corresponding server-requesting Pod.
+- If the (a) server-running Pod has an IP address, (b) the inference
+  server process is running (according to latest op or query to
+  launcher), (c) the vLLM engine is not sleeping, and (d) the dual-pod
+  controller has not already done so then the controller makes the
+  POST request on the stub in the server-requesting Pod to convey the
+  URL to poll for readiness.
+
+- If the inference server process has terminated, not yet restarted,
+  and the dual-pod controller has not already done so then the
+  controller makes the POST request on the stub to pass the empty
+  string as the URL to poll for readiness.
 
 **NOTE**: the delta from the sleep/wake only technique is fairly
   small. The only changes from sleep/wake-only to model swapping plus

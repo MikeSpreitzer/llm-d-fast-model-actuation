@@ -96,7 +96,7 @@ type controller struct {
 	podLister     corev1listers.PodLister
 	cmInformer    cache.SharedIndexInformer
 	cmLister      corev1listers.ConfigMapLister
-	genctlr.QueueAndWorkers[typedRef]
+	genctlr.QueueAndWorkers[objectRef]
 
 	// gpuMaps maps GPU UUID to GpuLocation
 	gpuMap atomic.Pointer[map[string]GpuLocation]
@@ -109,75 +109,77 @@ type GpuLocation struct {
 
 var _ Controller = &controller{}
 
-type typedRef struct {
-	Kind string
+type objectRef interface {
+	Parts() (namespace, name string)
+}
+
+type configMapRef struct {
 	cache.ObjectName
 }
 
-func (ref typedRef) String() string {
-	return ref.Kind + ":" + ref.ObjectName.String()
+type podRef struct {
+	cache.ObjectName
+
+	// OwningRequest is empty for a server-requesting Pod,
+	// names the server-requesting Pod for a server-running Pod.
+	OwningRequest string
 }
 
-const podKind = "Pod"
-const cmKind = "ConfigMap"
-
-func (ctl *controller) careAbout(pod *corev1.Pod) bool {
+func (ctl *controller) careAbout(pod *corev1.Pod) (podRef, bool) {
 	if len(pod.Annotations[api.ServerPatchAnnotationName]) > 0 {
-		return true
+		return podRef{cache.MetaObjectToName(pod), ""}, true
 	}
-	_, owned := IsOwnedByRequest(pod)
-	return owned
+	owner, owned := IsOwnedByRequest(pod)
+	if owned {
+		return podRef{cache.MetaObjectToName(pod), owner}, true
+	}
+	return podRef{}, false
 }
 
 func (ctl *controller) OnAdd(obj any, isInInitialList bool) {
-	var kind string
-	var objM metav1.Object
+	var ref objectRef
 	switch typed := obj.(type) {
 	case *corev1.Pod:
-		if !ctl.careAbout(typed) {
+		if podRef, care := ctl.careAbout(typed); !care {
 			ctl.enqueueLogger.V(5).Info("Ignoring irrelevant Pod", "name", typed.Name)
 			return
+		} else {
+			ref = podRef
 		}
-		objM = typed
-		kind = podKind
 	case *corev1.ConfigMap:
 		if typed.Name != GPUMapName {
 			ctl.enqueueLogger.V(5).Info("Ignoring ConfigMap that is not the GPU map", "ref", cache.MetaObjectToName(typed))
 			return
 		}
-		objM = typed
-		kind = cmKind
+		ref = configMapRef{cache.MetaObjectToName(typed)}
 	default:
 		ctl.enqueueLogger.Error(nil, "Notified of add of unexpected type of object", "type", fmt.Sprintf("%T", obj))
 		return
 	}
-	ref := typedRef{kind, cache.MetaObjectToName(objM)}
 	ctl.enqueueLogger.V(5).Info("Enqueuing reference due to notification of add", "ref", ref, "isInInitialList", isInInitialList)
 	ctl.Queue.Add(ref)
-
 }
 
 func (ctl *controller) OnUpdate(prev, obj any) {
-	var kind string
-	var objM metav1.Object
+	var ref objectRef
 	switch typed := obj.(type) {
 	case *corev1.Pod:
-		if !ctl.careAbout(typed) {
+		if podRef, care := ctl.careAbout(typed); !care {
+			ctl.enqueueLogger.V(5).Info("Ignoring irrelevant Pod", "name", typed.Name)
 			return
+		} else {
+			ref = podRef
 		}
-		objM = typed
-		kind = podKind
 	case *corev1.ConfigMap:
 		if typed.Name != GPUMapName {
+			ctl.enqueueLogger.V(5).Info("Ignoring ConfigMap that is not the GPU map", "ref", cache.MetaObjectToName(typed))
 			return
 		}
-		objM = typed
-		kind = cmKind
+		ref = configMapRef{cache.MetaObjectToName(typed)}
 	default:
 		ctl.enqueueLogger.Error(nil, "Notified of update of unexpected type of object", "type", fmt.Sprintf("%T", obj))
 		return
 	}
-	ref := typedRef{kind, cache.MetaObjectToName(objM)}
 	ctl.enqueueLogger.V(5).Info("Enqueuing reference due to notification of update", "ref", ref)
 	ctl.Queue.Add(ref)
 }
@@ -186,26 +188,25 @@ func (ctl *controller) OnDelete(obj any) {
 	if dfsu, ok := obj.(cache.DeletedFinalStateUnknown); ok {
 		obj = dfsu.Obj
 	}
-	var kind string
-	var objM metav1.Object
+	var ref objectRef
 	switch typed := obj.(type) {
 	case *corev1.Pod:
-		if !ctl.careAbout(typed) {
+		if podRef, care := ctl.careAbout(typed); !care {
+			ctl.enqueueLogger.V(5).Info("Ignoring irrelevant Pod", "name", typed.Name)
 			return
+		} else {
+			ref = podRef
 		}
-		objM = typed
-		kind = podKind
 	case *corev1.ConfigMap:
 		if typed.Name != GPUMapName {
+			ctl.enqueueLogger.V(5).Info("Ignoring ConfigMap that is not the GPU map", "ref", cache.MetaObjectToName(typed))
 			return
 		}
-		objM = typed
-		kind = cmKind
+		ref = configMapRef{cache.MetaObjectToName(typed)}
 	default:
 		ctl.enqueueLogger.Error(nil, "Notified of delete of unexpected type of object", "type", fmt.Sprintf("%T", obj))
 		return
 	}
-	ref := typedRef{kind, cache.MetaObjectToName(objM)}
 	ctl.enqueueLogger.V(5).Info("Enqueuing reference due to notification of delete", "ref", ref)
 	ctl.Queue.Add(ref)
 }
@@ -223,15 +224,15 @@ func (ctl *controller) Start(ctx context.Context) error {
 
 // process returns (err error, retry bool).
 // There will be a retry iff `retry || err != nil`.
-func (ctl *controller) process(ctx context.Context, ref typedRef) (error, bool) {
+func (ctl *controller) process(ctx context.Context, ref objectRef) (error, bool) {
 	logger := klog.FromContext(ctx)
-	switch ref.Kind {
-	case podKind:
-		return ctl.processPod(ctx, ref.ObjectName)
-	case cmKind:
-		return ctl.processConfigMap(ctx, ref.ObjectName)
+	switch typed := ref.(type) {
+	case podRef:
+		return ctl.processPod(ctx, typed.ObjectName)
+	case configMapRef:
+		return ctl.processConfigMap(ctx, typed.ObjectName)
 	default:
-		logger.Error(nil, "Asked to process unexpected Kind of object", "kind", ref.Kind)
+		logger.Error(nil, "Asked to process unexpected type of ref", "type", fmt.Sprintf("%T", ref), "ref", ref)
 		return nil, false
 	}
 }

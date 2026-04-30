@@ -239,6 +239,11 @@ func (ctl *controller) buildDesiredStateFromPolicies(ctx context.Context) (map[N
 		return nil, fmt.Errorf("failed to list LauncherPopulationPolicies: %w", err)
 	}
 
+	// lcStatusReported tracks LauncherConfigs whose Status has already been updated this
+	// reconcile cycle. A single LauncherConfig may be referenced by multiple policies or
+	// multiple count rules; we only need one Status update per LC per cycle.
+	lcStatusReported := make(map[string]struct{})
+
 	desired := make(map[NodeLauncherKey]DesiredStateEntry)
 	for _, lpp := range policies {
 		nodes, selectorErrs, err := ctl.getMatchingNodes(ctx, lpp.Spec.EnhancedNodeSelector)
@@ -263,6 +268,28 @@ func (ctl *controller) buildDesiredStateFromPolicies(ctx context.Context) (map[N
 					continue
 				}
 				return nil, fmt.Errorf("failed to get LauncherConfig %s: %w", countRule.LauncherConfigName, err)
+			}
+
+			// Validate the PodTemplate once per LauncherConfig, not once per node.
+			// This is a user error if the inference server container is missing.
+			var lcTemplateErrs []string
+			if templateErr := utils.ValidateLauncherPodTemplate(lc.Spec.PodTemplate); templateErr != nil {
+				logger.Error(templateErr, "Invalid PodTemplate in LauncherConfig, reporting in Status",
+					"config", countRule.LauncherConfigName, "policy", lpp.Name)
+				lcTemplateErrs = []string{templateErr.Error()}
+			}
+			// Unconditionally ensure the LauncherConfig Status reflects the current state.
+			// setLCStatusErrors is idempotent and skips the API call if Status is already correct.
+			// Guard with lcStatusReported so that a LC referenced by multiple policies or
+			// multiple count rules only triggers one Status update per reconcile cycle.
+			if _, alreadyReported := lcStatusReported[lc.Name]; !alreadyReported {
+				if statusErr := ctl.setLCStatusErrors(ctx, lc, lcTemplateErrs); statusErr != nil {
+					logger.Error(statusErr, "Failed to set Status for LauncherConfig", "config", countRule.LauncherConfigName)
+				}
+				lcStatusReported[lc.Name] = struct{}{}
+			}
+			if len(lcTemplateErrs) > 0 {
+				continue
 			}
 
 			for _, node := range nodes {
@@ -392,14 +419,15 @@ func (ctl *controller) reconcileLaunchersOnSingleNode(ctx context.Context, nodeN
 		// Compute the nominal hash for spec-change detection.
 		// BuildLauncherPodFromTemplate computes a hash of the fully built pod spec
 		// and stores it as the LauncherConfigHashAnnotationKey annotation.
+		// The PodTemplate has already been validated in buildDesiredStateFromPolicies;
+		// any LC with an invalid template is excluded from the desired map.
 		nominalHash := ""
 		if entry.LauncherConfigSpec != nil {
 			nominalPod, err := utils.BuildLauncherPodFromTemplate(
 				entry.LauncherConfigSpec.PodTemplate, ctl.namespace, key.NodeName, key.LauncherConfigName)
 			if err != nil {
-				// The only error possible here is that the PodTemplate lacks an inference server container.
-				// In that case we proceed without a nominal hash, so no stale-pod detection occurs for this config.
-				logger.Error(err, "Failed to build nominal pod for hash comparison",
+				// Should not happen: template was already validated upstream.
+				logger.Error(err, "Unexpected error building nominal pod (template should have been validated)",
 					"node", nodeName, "config", key.LauncherConfigName)
 			} else {
 				nominalHash = nominalPod.Annotations[string(common.LauncherConfigHashAnnotationKey)]

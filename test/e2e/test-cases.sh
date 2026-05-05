@@ -13,7 +13,6 @@
 #   FMA_CHART_INSTANCE_NAME - Helm release name prefix (default: fma)
 #   READY_TARGET            - minimum ready launchers before proceeding (default: 2)
 #   POLICIES_ENABLED        - "true"/"false"; auto-detected if unset
-#   E2E_PLATFORM            - "openshift" or "kind" (default: openshift)
 #   POLL_LIMIT_SECS         - polling timeout seconds (default: 600)
 #   FMA_DEBUG               - "true" to enable shell tracing (set -x)
 
@@ -28,7 +27,6 @@ fi
 POLL_LIMIT_SECS="${POLL_LIMIT_SECS:-600}"
 READY_TARGET="${READY_TARGET:-2}"
 FMA_CHART_INSTANCE_NAME="${FMA_CHART_INSTANCE_NAME:-fma}"
-E2E_PLATFORM="${E2E_PLATFORM:-openshift}"
 
 NS="$FMA_NAMESPACE"
 
@@ -71,9 +69,10 @@ expect() {
     done
 }
 
-# pin_gpu patches the ReplicaSet to bypass OpenShift's GPU assignment.
-# Sets nvidia.com/gpu limit/request to 0 and injects NVIDIA_VISIBLE_DEVICES
-# so subsequent pods reuse the same GPU UUID without going through the device plugin.
+# pin_gpu patches the ReplicaSet so subsequent pods reuse the same GPU UUID.
+# Sets nvidia.com/gpu limit/request to 0 (bypassing the NVIDIA device plugin's
+# fresh assignment on OpenShift) and injects NVIDIA_VISIBLE_DEVICES, which the
+# test-requester honors to restrict its random GPU pick to the pinned UUID.
 # Uses global $assigned_gpu_uuids and $NS.
 # Arguments: <rs-name>
 pin_gpu() {
@@ -226,15 +225,10 @@ date
 kubectl wait --for condition=Ready pod/$req1 -n "$NS" --timeout=180s
 [ "$(kubectl get pod $launcher1 -n "$NS" -o jsonpath='{.status.conditions[?(@.type=="Ready")].status}')" = "True" ]
 
-# On OpenShift, record the GPU UUID assigned by the cluster so we can pin it later.
-# The controller writes the UUID(s) to the dual-pods.llm-d.ai/accelerators annotation
-# after querying the requester's SPI endpoint; it is guaranteed to be set by the time
-# the pod is Ready.
-if [ "$E2E_PLATFORM" = "openshift" ]; then
-    expect '[ -n "$(kubectl get pod -n '"$NS"' $req1 -o jsonpath={.metadata.annotations.dual-pods\\.llm-d\\.ai/accelerators})" ]'
-    assigned_gpu_uuids=$(kubectl get pod "$req1" -n "$NS" -o jsonpath='{.metadata.annotations.dual-pods\.llm-d\.ai/accelerators}')
-    echo "Assigned GPU UUID(s) on OpenShift: $assigned_gpu_uuids"
-fi
+# Discover and remember the assigned GPUs.
+expect '[ -n "$(kubectl get pod -n '"$NS"' $req1 -o jsonpath={.metadata.annotations.dual-pods\\.llm-d\\.ai/accelerators})" ]'
+assigned_gpu_uuids=$(kubectl get pod "$req1" -n "$NS" -o jsonpath='{.metadata.annotations.dual-pods\.llm-d\.ai/accelerators}')
+echo "Assigned GPU UUID(s): $assigned_gpu_uuids"
 
 cheer Successful launcher-based pod creation
 
@@ -350,8 +344,8 @@ kubectl scale rs $rs -n "$NS" --replicas=0
 
 expect "kubectl get pods -n $NS -o name -l app=dp-example,instance=$inst | wc -l | grep -w 0"
 
-# On OpenShift, pin the GPU so the next scale-up reuses the same GPU.
-if [ "$E2E_PLATFORM" = "openshift" ]; then pin_gpu $rs; fi
+# Pin the GPU so the next scale-up reuses the same GPU on every platform.
+pin_gpu $rs
 
 # Patch requester ReplicaSet to stick to testnode
 kubectl patch rs $rs -n "$NS" -p '{"spec": {"template": {"spec": {"nodeSelector": {"kubernetes.io/hostname": "'$testnode'"} }} }}'
@@ -395,8 +389,8 @@ date
 kubectl wait --for condition=Ready pod/$req2 -n "$NS" --timeout=120s
 [ "$(kubectl get pod $launcher1 -n "$NS" -o jsonpath='{.status.conditions[?(@.type=="Ready")].status}')" = "True" ]
 
-# On OpenShift, verify the same GPU UUID was assigned after wake-up.
-if [ "$E2E_PLATFORM" = "openshift" ]; then check_gpu_pin $req2; fi
+# Verify the same GPU UUID was assigned after wake-up.
+check_gpu_pin $req2
 
 cheer Successful instance wake-up fast path
 
@@ -441,7 +435,7 @@ date
 kubectl wait --for condition=Ready pod/$req3 -n "$NS" --timeout=120s
 [ "$(kubectl get pod $launcher1 -n "$NS" -o jsonpath='{.status.conditions[?(@.type=="Ready")].status}')" = "True" ]
 
-if [ "$E2E_PLATFORM" = "openshift" ]; then check_gpu_pin $req3; fi
+check_gpu_pin $req3
 
 cheer Successful multiple instances sharing one launcher
 
@@ -486,7 +480,7 @@ date
 kubectl wait --for condition=Ready pod/$req4 -n "$NS" --timeout=120s
 [ "$(kubectl get pod $launcher1 -n "$NS" -o jsonpath='{.status.conditions[?(@.type=="Ready")].status}')" = "True" ]
 
-if [ "$E2E_PLATFORM" = "openshift" ]; then check_gpu_pin $req4; fi
+check_gpu_pin $req4
 
 cheer Successful switching instances in one launcher
 
@@ -552,7 +546,7 @@ date
 kubectl wait --for condition=Ready pod/$req_post_restart -n "$NS" --timeout=30s
 [ "$(kubectl get pod $launcher1 -n "$NS" -o jsonpath='{.status.conditions[?(@.type=="Ready")].status}')" = "True" ]
 
-if [ "$E2E_PLATFORM" = "openshift" ]; then check_gpu_pin $req_post_restart; fi
+check_gpu_pin $req_post_restart
 
 cheer Successful controller restart state recovery
 
@@ -650,7 +644,7 @@ kubectl wait --for condition=Ready pod/$req_after_delete -n "$NS" --timeout=120s
 [ "$(kubectl get pod $launcher_after_delete -n "$NS" -o jsonpath='{.status.conditions[?(@.type=="Ready")].status}')" = "True" ]
 
 # Check that the new requester has the proper GPU UUIDs annotation.
-if [ "$E2E_PLATFORM" = "openshift" ]; then check_gpu_pin $req_after_delete; fi
+check_gpu_pin $req_after_delete
 
 cheer Successful unbound launcher deletion cleanup
 
@@ -666,8 +660,8 @@ intro_case Stopped Instance Recovery
 #
 # Starting state: $req_after_delete is bound to $launcher_after_delete, both Ready.
 
-echo "Bound requester: $req_after_delete, launcher: $launcher_after_delete"
 req_uid_before=$(kubectl get pod $req_after_delete -n "$NS" -o jsonpath='{.metadata.uid}')
+echo "Bound requester: $req_after_delete (UID $req_uid_before), launcher: $launcher_after_delete"
 
 # Get the running instance ID from the launcher
 instance_id=$(kubectl exec -n "$NS" $launcher_after_delete -c inference-server -- python3 -c '
@@ -717,7 +711,7 @@ date
 kubectl wait --for condition=Ready pod/$req_recovered -n "$NS" --timeout=120s
 [ "$(kubectl get pod $launcher_after_delete -n "$NS" -o jsonpath='{.status.conditions[?(@.type=="Ready")].status}')" = "True" ]
 
-if [ "$E2E_PLATFORM" = "openshift" ]; then check_gpu_pin $req_recovered; fi
+check_gpu_pin $req_recovered
 
 cheer Successful stopped instance recovery
 

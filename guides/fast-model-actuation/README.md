@@ -47,7 +47,7 @@ git clone https://github.com/llm-d/llm-d.git && cd llm-d && git checkout ${BRANC
 
 <!-- guide:env.static start -->
 ```bash
-export BRANCH=testy
+export BRANCH=main
 export REPO_ROOT=$(realpath $(git rev-parse --show-toplevel))
 export GUIDE_NAME=fast-model-actuation
 export NAMESPACE=llm-d-fast-model-actuation

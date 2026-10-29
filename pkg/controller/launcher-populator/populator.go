@@ -339,7 +339,11 @@ func (ctl *controller) OnDelete(obj any) {
 
 func (ctl *controller) Start(ctx context.Context) error {
 	ctl.eventBroadcaster.StartRecordingToSink(&coreclient.EventSinkImpl{Interface: ctl.coreclient.Events("")})
-	context.AfterFunc(ctx, ctl.eventBroadcaster.Shutdown)
+	context.AfterFunc(ctx, func() {
+		ctl.digestQueue.Queue.ShutDown()
+		ctl.keyQueue.Queue.ShutDown()
+		ctl.eventBroadcaster.Shutdown()
+	})
 	if !cache.WaitForNamedCacheSync(ControllerName, ctx.Done(), ctl.lppInformer.HasSynced, ctl.lcInformer.HasSynced, ctl.podInformer.HasSynced, ctl.nodeInformer.HasSynced) {
 		return fmt.Errorf("caches not synced before end of Start context")
 	}

@@ -18,6 +18,7 @@ package launcherpopulator
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"reflect"
 	"slices"
@@ -25,15 +26,47 @@ import (
 	"testing"
 	"time"
 
-	fmav1alpha1 "github.com/llm-d-incubation/llm-d-fast-model-actuation/api/fma/v1alpha1"
-	"github.com/llm-d-incubation/llm-d-fast-model-actuation/pkg/controller/common"
-	"github.com/llm-d-incubation/llm-d-fast-model-actuation/pkg/controller/utils"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/util/wait"
 	k8sfake "k8s.io/client-go/kubernetes/fake"
+	"k8s.io/client-go/tools/cache"
+
+	fmav1alpha1 "github.com/llm-d-incubation/llm-d-fast-model-actuation/api/fma/v1alpha1"
+	"github.com/llm-d-incubation/llm-d-fast-model-actuation/pkg/controller/common"
+	"github.com/llm-d-incubation/llm-d-fast-model-actuation/pkg/controller/utils"
 )
+
+var errNotQuiet = errors.New("controller did not quiesce in time")
+
+func (ctl *controller) runUntilQuiet(t *testing.T, idleTime, timeout time.Duration) bool {
+	ctxTimed, cancel := context.WithTimeoutCause(t.Context(), timeout, errNotQuiet)
+	defer cancel()
+	if !cache.WaitForNamedCacheSync("test", ctxTimed.Done(), ctl.digestQueue.HasProcessedSync) {
+		t.Fatalf("digestQueue.HasProcessedSync not reached in %v", timeout)
+		return false
+	}
+	lastDigesterStatus := ctl.digestQueue.GetStatus()
+	lastKeyerStatus := ctl.keyQueue.GetStatus()
+	err := wait.PollUntilContextCancel(ctxTimed, idleTime, false, func(ctx context.Context) (done bool, err error) {
+		nextDigesterStatus := ctl.digestQueue.GetStatus()
+		nextKeyerStatus := ctl.keyQueue.GetStatus()
+		if lastDigesterStatus == nextDigesterStatus && lastKeyerStatus == nextKeyerStatus &&
+			time.Since(lastDigesterStatus.ApproxLastChangeTime) >= idleTime &&
+			time.Since(lastKeyerStatus.ApproxLastChangeTime) >= idleTime {
+			return true, nil
+		}
+		lastDigesterStatus = nextDigesterStatus
+		lastKeyerStatus = nextKeyerStatus
+		return false, nil
+	})
+	if err != nil {
+		t.Fatalf("controller did not quiesce in %v", timeout)
+		return false
+	}
+	return true
+}
 
 func TestReconcileNodeAvailability(t *testing.T) {
 	for _, nodeState := range []string{"missing", "deleting"} {
@@ -61,6 +94,9 @@ func TestReconcileNodeAvailability(t *testing.T) {
 					}
 
 					ctl, cs, _ := newStuckTestControllerWithoutNode(t, stuckTestNow, objects...)
+					if !ctl.runUntilQuiet(t, time.Second*5, time.Minute) {
+						return
+					}
 
 					err, requeue := ctl.reconcileKey(t.Context(), stuckTestKey(), desiredCount, testTemplateHash, nodeTemplate(), pods)
 					if err != nil {

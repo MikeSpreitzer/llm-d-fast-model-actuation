@@ -30,7 +30,6 @@ import (
 	"k8s.io/client-go/informers"
 	k8sfake "k8s.io/client-go/kubernetes/fake"
 	k8stesting "k8s.io/client-go/testing"
-	"k8s.io/client-go/tools/cache"
 	"k8s.io/client-go/tools/record"
 	"k8s.io/klog/v2"
 	testingclock "k8s.io/utils/clock/testing"
@@ -74,21 +73,16 @@ func newStuckTestControllerWithoutNode(t *testing.T, now time.Time, objs ...runt
 		t.Fatalf("NewController: %v", err)
 	}
 	t.Cleanup(func() {
-		ctl.digestQueue.Queue.ShutDown()
-		ctl.keyQueue.Queue.ShutDown()
 		coreFactory.Shutdown()
 		fmaFactory.Shutdown()
-		ctl.eventBroadcaster.Shutdown()
 	})
 	rec := record.NewFakeRecorder(50)
 	ctl.recorder = rec
 	ctl.clock = testingclock.NewFakeClock(now)
 	coreFactory.Start(t.Context().Done())
 	fmaFactory.Start(t.Context().Done())
-	if !cache.WaitForCacheSync(t.Context().Done(), ctl.podInformer.HasSynced, ctl.nodeInformer.HasSynced, ctl.lcInformer.HasSynced, ctl.lppInformer.HasSynced) {
-		t.Fatal("test informer caches did not sync")
-	}
 	cs.ClearActions()
+	ctl.Start(t.Context())
 	return ctl, cs, rec
 }
 

@@ -49,6 +49,7 @@ const ControllerName = "launcher-populator"
 
 type Controller interface {
 	Start(context.Context) error
+	GetStatus() (genctlr.Status, genctlr.Status)
 }
 
 // NewController makes a new dual pods controller.
@@ -154,6 +155,10 @@ type controller struct {
 	// digestQueue processes API-object references (LC/LPP/Node). Single worker;
 	// the SOLE writer of ctl.policy.
 	digestQueue *genctlr.KnowsProcessedSync[queueItem]
+
+	// This prevents creating the goroutines that process items
+	// from `keyQueue`. Used for testing.
+	noKeyWorkers bool
 
 	// keyQueue processes per-NodeLauncherKey reconciliation. Started by
 	// onDigestSyncProcessed once the initial batch has drained.
@@ -360,9 +365,13 @@ func (ctl *controller) Start(ctx context.Context) error {
 func (ctl *controller) onDigestSyncProcessed(ctx context.Context) {
 	logger := klog.FromContext(ctx)
 	ctl.policy.mu.RLock()
-	logger.V(1).Info("Initial digest batch processed; starting key workers",
+	logger.V(1).Info("Initial digest batch processed",
+		"startingKeyWorkers", !ctl.noKeyWorkers,
 		"lpps", len(ctl.policy.lpps), "lcs", len(ctl.policy.lcs), "keys", ctl.keyQueue.Queue.Len())
 	ctl.policy.mu.RUnlock()
+	if ctl.noKeyWorkers {
+		return
+	}
 	if err := ctl.keyQueue.StartWorkers(ctx); err != nil {
 		logger.Error(err, "Failed to start key workers")
 	}
@@ -673,4 +682,8 @@ func (ctl *controller) getCurrentLaunchersOnNode(ctx context.Context, key NodeLa
 
 	// unreachable
 	return nil, ExpectationsSatisfied, nil
+}
+
+func (ctl *controller) GetStatus() (genctlr.Status, genctlr.Status) {
+	return ctl.digestQueue.GetStatus(), ctl.keyQueue.GetStatus()
 }

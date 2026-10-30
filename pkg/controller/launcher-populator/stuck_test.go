@@ -28,6 +28,7 @@ import (
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/informers"
+	"k8s.io/client-go/kubernetes"
 	k8sfake "k8s.io/client-go/kubernetes/fake"
 	k8stesting "k8s.io/client-go/testing"
 	"k8s.io/client-go/tools/record"
@@ -82,6 +83,7 @@ func newStuckTestControllerWithoutNode(t *testing.T, now time.Time, objs ...runt
 	coreFactory.Start(t.Context().Done())
 	fmaFactory.Start(t.Context().Done())
 	cs.ClearActions()
+	ctl.noKeyWorkers = true // suppress workers for the key queue
 	ctl.Start(t.Context())
 	return ctl, cs, rec
 }
@@ -206,7 +208,7 @@ func assertWarningLauncherStuck(t *testing.T, events []string, wantSubstr string
 	}
 }
 
-func podExists(t *testing.T, cs *k8sfake.Clientset, name string) bool {
+func podExists(t *testing.T, cs kubernetes.Interface, name string) bool {
 	t.Helper()
 	_, err := cs.CoreV1().Pods(stuckTestNamespace).Get(t.Context(), name, metav1.GetOptions{})
 	if err == nil {

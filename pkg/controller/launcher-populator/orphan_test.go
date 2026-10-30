@@ -47,6 +47,9 @@ func (ctl *controller) runUntilQuiet(t *testing.T, idleTime, timeout time.Durati
 		t.Fatalf("digestQueue.HasProcessedSync not reached in %v", timeout)
 		return false
 	}
+	if ctl.noKeyWorkers {
+		return true
+	}
 	lastDigesterStatus := ctl.digestQueue.GetStatus()
 	lastKeyerStatus := ctl.keyQueue.GetStatus()
 	err := wait.PollUntilContextCancel(ctxTimed, idleTime, false, func(ctx context.Context) (done bool, err error) {
@@ -85,20 +88,25 @@ func TestReconcileNodeAvailability(t *testing.T) {
 						bound.Annotations[common.RequesterAnnotationKey] = "requester-uid requester"
 						pods = []*corev1.Pod{orphan, bound}
 					}
-					objects := podsToObjects(pods)
-					if nodeState == "deleting" {
-						node := testNode()
-						deleting := metav1.NewTime(stuckTestNow)
-						node.DeletionTimestamp = &deleting
-						objects = append(objects, node)
-					}
-
-					ctl, cs, _ := newStuckTestControllerWithoutNode(t, stuckTestNow, objects...)
+					podObjs := podsToObjects(pods)
+					_, _, node, setupObjs := orphanSetupObjects()
+					ctl, cs, _ := newStuckTestControllerWithoutNode(t, stuckTestNow, append(setupObjs, podObjs...)...)
 					if !ctl.runUntilQuiet(t, time.Second*5, time.Minute) {
 						return
 					}
+					ctx := t.Context()
 
-					err, requeue := ctl.reconcileKey(t.Context(), stuckTestKey(), desiredCount, testTemplateHash, nodeTemplate(), pods)
+					if nodeState == "deleting" {
+						node = node.DeepCopy()
+						deleting := metav1.NewTime(stuckTestNow)
+						node.DeletionTimestamp = &deleting
+						cs.CoreV1().Nodes().Update(ctx, node, metav1.UpdateOptions{})
+					} else {
+						cs.CoreV1().Nodes().Delete(ctx, node.Name, *metav1.NewDeleteOptions(0))
+					}
+
+					cs.ClearActions()
+					err, requeue := ctl.reconcileKey(ctx, stuckTestKey(), desiredCount, testTemplateHash, nodeTemplate(), pods)
 					if err != nil {
 						t.Fatalf("reconcileKey: %v", err)
 					}
@@ -137,7 +145,7 @@ func TestReconcileLiveNodeCreatesLauncher(t *testing.T) {
 func TestNodeDeletionCleansLaunchersWithoutPolicyChange(t *testing.T) {
 	for _, event := range []string{"delete", "update-deleting"} {
 		t.Run(event, func(t *testing.T) {
-			lpp, node, objects := orphanLifecycleObjects(t)
+			lpp, node, objects := orphanLifecycleObjects(t, true)
 			ctl, cs, _ := newStuckTestControllerWithoutNode(t, stuckTestNow, objects...)
 			progress := observeOrphanReconciles(ctl)
 			if err := ctl.Start(t.Context()); err != nil {
@@ -197,7 +205,7 @@ func TestNodeDeletionCleansLaunchersWithoutPolicyChange(t *testing.T) {
 }
 
 func TestPopulationPolicyDownscaleCleansLaunchers(t *testing.T) {
-	lpp, _, objects := orphanLifecycleObjects(t)
+	lpp, _, objects := orphanLifecycleObjects(t, true)
 	ctl, cs, _ := newStuckTestControllerWithoutNode(t, stuckTestNow, objects...)
 	progress := observeOrphanReconciles(ctl)
 	if err := ctl.Start(t.Context()); err != nil {
@@ -219,11 +227,9 @@ func TestPopulationPolicyDownscaleCleansLaunchers(t *testing.T) {
 }
 
 func TestStartupCleansLaunchersWithoutNodeOrPolicy(t *testing.T) {
-	orphan := orphanLifecyclePod("orphan", testTemplateHash)
-	orphan.Status.Phase = corev1.PodPending
-	orphan.Status.Conditions = nil
+	orphan := orphanLifecyclePod("orphan", testTemplateHash, false)
 	ctl, cs, _ := newStuckTestControllerWithoutNode(t, stuckTestNow,
-		orphan, orphanLifecyclePod("bound", testTemplateHash))
+		orphan, orphanLifecyclePod("bound", testTemplateHash, true))
 	if err := ctl.Start(t.Context()); err != nil {
 		t.Fatal(err)
 	}
@@ -231,8 +237,7 @@ func TestStartupCleansLaunchersWithoutNodeOrPolicy(t *testing.T) {
 	assertNoOrphanReplacement(t, cs)
 }
 
-func orphanLifecycleObjects(t *testing.T) (*fmav1alpha1.LauncherPopulationPolicy, *corev1.Node, []runtime.Object) {
-	t.Helper()
+func orphanSetupObjects() (*fmav1alpha1.LauncherConfig, *fmav1alpha1.LauncherPopulationPolicy, *corev1.Node, []runtime.Object) {
 	lc := &fmav1alpha1.LauncherConfig{
 		ObjectMeta: metav1.ObjectMeta{Name: stuckTestLauncherConfig, Namespace: stuckTestNamespace, Generation: 1},
 		Spec: fmav1alpha1.LauncherConfigSpec{
@@ -247,20 +252,29 @@ func orphanLifecycleObjects(t *testing.T) (*fmav1alpha1.LauncherPopulationPolicy
 		},
 	}
 	node := testNode()
+	return lc, lpp, node, []runtime.Object{lc, lpp, node}
+}
+
+func orphanLifecycleObjects(t *testing.T, podsRunning bool) (*fmav1alpha1.LauncherPopulationPolicy, *corev1.Node, []runtime.Object) {
+	t.Helper()
+	lc, lpp, node, setupObjs := orphanSetupObjects()
 	_, templateHash, err := utils.BuildNodeIndependentLauncherTemplate(lc)
 	if err != nil {
 		t.Fatal(err)
 	}
-	return lpp, node, []runtime.Object{lc, lpp, node, orphanLifecyclePod("orphan", templateHash), orphanLifecyclePod("bound", templateHash)}
+	return lpp, node, append(setupObjs, orphanLifecyclePod("orphan", templateHash, podsRunning), orphanLifecyclePod("bound", templateHash, podsRunning))
 }
 
-func orphanLifecyclePod(name, templateHash string) *corev1.Pod {
-	pod := ready(stuckLauncherPod(name))
+func orphanLifecyclePod(name, templateHash string, running bool) *corev1.Pod {
+	pod := stuckLauncherPod(name)
 	pod.Labels[common.NodeNameLabelKey] = stuckTestNode
 	pod.Labels[common.ComponentLabelKey] = common.LauncherComponentLabelValue
 	pod.Annotations[common.LauncherTemplateHashAnnotationKey] = templateHash
 	pod.Spec.NodeSelector = map[string]string{"kubernetes.io/hostname": stuckTestNode}
-	pod.Status.Phase = corev1.PodRunning
+	if running {
+		ready(pod)
+		pod.Status.Phase = corev1.PodRunning
+	}
 	if name == "bound" {
 		pod.Annotations[common.RequesterAnnotationKey] = "requester-uid requester"
 	}

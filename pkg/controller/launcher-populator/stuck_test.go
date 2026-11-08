@@ -38,6 +38,7 @@ import (
 	fmav1alpha1 "github.com/llm-d-incubation/llm-d-fast-model-actuation/api/fma/v1alpha1"
 	"github.com/llm-d-incubation/llm-d-fast-model-actuation/pkg/api"
 	"github.com/llm-d-incubation/llm-d-fast-model-actuation/pkg/controller/common"
+	"github.com/llm-d-incubation/llm-d-fast-model-actuation/pkg/controller/utils"
 	fmafake "github.com/llm-d-incubation/llm-d-fast-model-actuation/pkg/generated/clientset/versioned/fake"
 	fmainformers "github.com/llm-d-incubation/llm-d-fast-model-actuation/pkg/generated/informers/externalversions"
 )
@@ -52,7 +53,7 @@ const (
 
 var stuckTestNow = time.Date(2026, 6, 21, 12, 0, 0, 0, time.UTC)
 
-func newStuckTestControllerWithoutNode(t *testing.T, now time.Time, objs ...runtime.Object) (*controller, *k8sfake.Clientset, *record.FakeRecorder) {
+func newStuckTestControllerWithoutNode(t *testing.T, now time.Time, objs ...runtime.Object) (*controller, *k8sfake.Clientset, *fmafake.Clientset, *record.FakeRecorder) {
 	t.Helper()
 	var coreObjects, fmaObjects []runtime.Object
 	for _, obj := range objs {
@@ -85,10 +86,10 @@ func newStuckTestControllerWithoutNode(t *testing.T, now time.Time, objs ...runt
 	cs.ClearActions()
 	ctl.noKeyWorkers = true // suppress workers for the key queue
 	ctl.Start(t.Context())
-	return ctl, cs, rec
+	return ctl, cs, fmaCS, rec
 }
 
-func newStuckTestController(t *testing.T, now time.Time, objs ...*corev1.Pod) (*controller, *k8sfake.Clientset, *record.FakeRecorder) {
+func newStuckTestController(t *testing.T, now time.Time, objs ...*corev1.Pod) (*controller, *k8sfake.Clientset, *fmafake.Clientset, *record.FakeRecorder) {
 	t.Helper()
 	return newStuckTestControllerWithoutNode(t, now, append(podsToObjects(objs), testNode())...)
 }
@@ -104,7 +105,7 @@ func podsToObjects(pods []*corev1.Pod) []runtime.Object {
 // stuckLauncherPod builds a launcher Pod in the current namespace with the
 // current template hash.
 func stuckLauncherPod(name string) *corev1.Pod {
-	return &corev1.Pod{
+	pod := &corev1.Pod{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:        name,
 			Namespace:   stuckTestNamespace,
@@ -113,6 +114,8 @@ func stuckLauncherPod(name string) *corev1.Pod {
 			Annotations: map[string]string{common.LauncherTemplateHashAnnotationKey: testTemplateHash},
 		},
 	}
+	pod = utils.SpecializeLauncherTemplateToNode(pod, stuckTestNode)
+	return pod
 }
 
 // scheduledNotReadyAt marks the Pod scheduled at t and not Ready, so its age is
@@ -225,7 +228,7 @@ func podExists(t *testing.T, cs kubernetes.Interface, name string) bool {
 // kept, labeled, and reported once.
 func TestReportStuckLaunchersLabelsAndReports(t *testing.T) {
 	pod := scheduledNotReadyAt(stuckLauncherPod("launcher-stuck"), stuckTestNow.Add(-10*time.Minute))
-	ctl, cs, rec := newStuckTestController(t, stuckTestNow, pod)
+	ctl, cs, _, rec := newStuckTestController(t, stuckTestNow, pod)
 
 	if err := ctl.reportStuckLaunchers(t.Context(), []*corev1.Pod{pod}, testTemplateHash); err != nil {
 		t.Fatalf("reportStuckLaunchers: %v", err)
@@ -248,7 +251,7 @@ func TestReportStuckLaunchersLabelsAndReports(t *testing.T) {
 func TestReportStuckLaunchersAlreadyLabeledNoEvent(t *testing.T) {
 	pod := scheduledNotReadyAt(stuckLauncherPod("launcher-labeled"), stuckTestNow.Add(-10*time.Minute))
 	pod.Labels[common.LauncherStuckLabelKey] = "true"
-	ctl, _, rec := newStuckTestController(t, stuckTestNow, pod)
+	ctl, _, _, rec := newStuckTestController(t, stuckTestNow, pod)
 
 	if err := ctl.reportStuckLaunchers(t.Context(), []*corev1.Pod{pod}, testTemplateHash); err != nil {
 		t.Fatalf("reportStuckLaunchers: %v", err)
@@ -264,7 +267,7 @@ func TestReportStuckLaunchersAlreadyLabeledNoEvent(t *testing.T) {
 func TestReportStuckLaunchersClearsLabelOnRecovery(t *testing.T) {
 	pod := ready(stuckLauncherPod("launcher-recovered"))
 	pod.Labels[common.LauncherStuckLabelKey] = "true"
-	ctl, cs, rec := newStuckTestController(t, stuckTestNow, pod)
+	ctl, cs, _, rec := newStuckTestController(t, stuckTestNow, pod)
 
 	if err := ctl.reportStuckLaunchers(t.Context(), []*corev1.Pod{pod}, testTemplateHash); err != nil {
 		t.Fatalf("reportStuckLaunchers: %v", err)
@@ -287,7 +290,7 @@ func TestReportStuckLaunchersClearsLabelOnRecovery(t *testing.T) {
 // enforcement still deletes an excess stuck launcher.
 func TestReconcileKeyDownscaleDeletesStuck(t *testing.T) {
 	pod := scheduledNotReadyAt(stuckLauncherPod("launcher-downscale"), stuckTestNow.Add(-10*time.Minute))
-	ctl, cs, rec := newStuckTestController(t, stuckTestNow, pod)
+	ctl, cs, _, rec := newStuckTestController(t, stuckTestNow, pod)
 
 	err, _ := ctl.reconcileKey(t.Context(), stuckTestKey(), 0, testTemplateHash, nodeTemplate(), []*corev1.Pod{pod})
 	if err != nil {
@@ -309,7 +312,7 @@ func TestReconcileKeyDownscaleDeletesStuck(t *testing.T) {
 func TestReconcileKeyDownscaleDeleteConflictDefersStuckReporting(t *testing.T) {
 	healthy := ready(stuckLauncherPod("launcher-healthy"))
 	stuck := scheduledNotReadyAt(stuckLauncherPod("launcher-stuck"), stuckTestNow.Add(-10*time.Minute))
-	ctl, cs, rec := newStuckTestController(t, stuckTestNow, healthy, stuck)
+	ctl, cs, _, rec := newStuckTestController(t, stuckTestNow, healthy, stuck)
 	cs.PrependReactor("delete", "pods", func(action k8stesting.Action) (bool, runtime.Object, error) {
 		deleteAction := action.(k8stesting.DeleteAction)
 		if deleteAction.GetName() != stuck.Name {
@@ -364,7 +367,7 @@ func TestReconcileKeyDownscaleDeleteConflictDefersStuckReporting(t *testing.T) {
 // launcher is left completely untouched.
 func TestReportStuckLaunchersIgnoresHealthy(t *testing.T) {
 	pod := ready(stuckLauncherPod("launcher-healthy"))
-	ctl, cs, rec := newStuckTestController(t, stuckTestNow, pod)
+	ctl, cs, _, rec := newStuckTestController(t, stuckTestNow, pod)
 
 	if err := ctl.reportStuckLaunchers(t.Context(), []*corev1.Pod{pod}, testTemplateHash); err != nil {
 		t.Fatalf("reportStuckLaunchers: %v", err)
@@ -389,7 +392,7 @@ func TestReportStuckLaunchersIgnoresHealthy(t *testing.T) {
 func TestReportStuckLaunchersReportsStuckScheduling(t *testing.T) {
 	// Old creation, never scheduled -> stuck_scheduling.
 	pod := createdAt(stuckLauncherPod("launcher-unsched"), stuckTestNow.Add(-10*time.Minute))
-	ctl, cs, rec := newStuckTestController(t, stuckTestNow, pod)
+	ctl, cs, _, rec := newStuckTestController(t, stuckTestNow, pod)
 
 	if err := ctl.reportStuckLaunchers(t.Context(), []*corev1.Pod{pod}, testTemplateHash); err != nil {
 		t.Fatalf("reportStuckLaunchers: %v", err)
@@ -407,7 +410,7 @@ func TestReportStuckLaunchersReportsStuckScheduling(t *testing.T) {
 // G4: TestSetStuckLabelIgnoresNotFound verifies labeling a Pod that no longer
 // exists is a no-op (no error), since the Pod may be deleted concurrently.
 func TestSetStuckLabelIgnoresNotFound(t *testing.T) {
-	ctl, _, _ := newStuckTestController(t, stuckTestNow) // empty clientset
+	ctl, _, _, _ := newStuckTestController(t, stuckTestNow) // empty clientset
 	pod := stuckLauncherPod("launcher-gone")
 
 	if err := ctl.setStuckLabel(t.Context(), pod, true); err != nil {
@@ -423,7 +426,7 @@ func TestSetStuckLabelIgnoresNotFound(t *testing.T) {
 // sole Pod satisfying desired count, and is labeled and reported.
 func TestReconcileKeyReportsStuckWithoutReplacement(t *testing.T) {
 	pod := scheduledNotReadyAt(stuckLauncherPod("launcher-stuck"), stuckTestNow.Add(-10*time.Minute))
-	ctl, cs, rec := newStuckTestController(t, stuckTestNow, pod)
+	ctl, cs, _, rec := newStuckTestController(t, stuckTestNow, pod)
 
 	err, requeue := ctl.reconcileKey(t.Context(), stuckTestKey(), 1, testTemplateHash, nodeTemplate(), []*corev1.Pod{pod})
 	if err != nil {
@@ -468,7 +471,7 @@ func TestReportStuckLaunchersPropagatesLabelPatchError(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			ctl, cs, _ := newStuckTestController(t, stuckTestNow, tc.pod)
+			ctl, cs, _, _ := newStuckTestController(t, stuckTestNow, tc.pod)
 			cs.PrependReactor("patch", "pods", func(action k8stesting.Action) (bool, runtime.Object, error) {
 				return true, nil, apierrors.NewInternalError(errors.New("boom"))
 			})

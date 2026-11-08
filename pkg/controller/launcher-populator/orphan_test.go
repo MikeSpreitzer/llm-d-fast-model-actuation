@@ -31,6 +31,7 @@ import (
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/util/wait"
 	k8sfake "k8s.io/client-go/kubernetes/fake"
+	k8stesting "k8s.io/client-go/testing"
 	"k8s.io/client-go/tools/cache"
 
 	fmav1alpha1 "github.com/llm-d-incubation/llm-d-fast-model-actuation/api/fma/v1alpha1"
@@ -90,29 +91,39 @@ func TestReconcileNodeAvailability(t *testing.T) {
 					}
 					podObjs := podsToObjects(pods)
 					_, _, node, setupObjs := orphanSetupObjects()
-					ctl, cs, _ := newStuckTestControllerWithoutNode(t, stuckTestNow, append(setupObjs, podObjs...)...)
+					ctl, cs, fmaCS, _ := newStuckTestControllerWithoutNode(t, stuckTestNow, append(setupObjs, podObjs...)...)
+					time.Sleep(time.Second) // let informers do their asynchronous things
 					if !ctl.runUntilQuiet(t, time.Second*5, time.Minute) {
 						return
 					}
 					ctx := t.Context()
+					cs.ClearActions()
+					fmaCS.ClearActions()
 
+					expectedActions := []actionAbstract{}
 					if nodeState == "deleting" {
 						node = node.DeepCopy()
 						deleting := metav1.NewTime(stuckTestNow)
 						node.DeletionTimestamp = &deleting
 						cs.CoreV1().Nodes().Update(ctx, node, metav1.UpdateOptions{})
+						expectedActions = append(expectedActions, actionAbstract{"update", "nodes"})
 					} else {
 						cs.CoreV1().Nodes().Delete(ctx, node.Name, *metav1.NewDeleteOptions(0))
+						expectedActions = append(expectedActions, actionAbstract{"delete", "nodes"})
+					}
+					time.Sleep(time.Second) // let informers do their asynchronous things
+					if !ctl.runUntilQuiet(t, time.Second*5, time.Minute) {
+						return
 					}
 
-					cs.ClearActions()
 					err, requeue := ctl.reconcileKey(ctx, stuckTestKey(), desiredCount, testTemplateHash, nodeTemplate(), pods)
 					if err != nil {
 						t.Fatalf("reconcileKey: %v", err)
 					}
 					if templateState == "no-pods" {
-						if len(cs.Actions()) != 0 || requeue {
-							t.Fatalf("unavailable Node with no launchers must do nothing, actions=%v, requeue=%v", cs.Actions(), requeue)
+						checkActions(t, cs.Actions(), expectedActions)
+						if requeue {
+							t.Fatalf("unavailable Node with no launchers must not requeue")
 						}
 						return
 					}
@@ -125,6 +136,11 @@ func TestReconcileNodeAvailability(t *testing.T) {
 					if !podExists(t, cs, "bound") {
 						t.Error("bound launcher must be left for the dual-pods controller")
 					}
+					expectedActions = append(expectedActions,
+						actionAbstract{"get", "pods"},
+						actionAbstract{"delete", "pods"})
+					checkActions(t, cs.Actions(), expectedActions)
+					checkActions(t, fmaCS.Actions(), []actionAbstract{})
 				})
 			}
 		}
@@ -132,7 +148,7 @@ func TestReconcileNodeAvailability(t *testing.T) {
 }
 
 func TestReconcileLiveNodeCreatesLauncher(t *testing.T) {
-	ctl, cs, _ := newStuckTestController(t, stuckTestNow)
+	ctl, cs, _, _ := newStuckTestController(t, stuckTestNow)
 	if err, _ := ctl.reconcileKey(t.Context(), stuckTestKey(), 1, testTemplateHash, nodeTemplate(), nil); err != nil {
 		t.Fatalf("reconcileKey: %v", err)
 	}
@@ -146,7 +162,7 @@ func TestNodeDeletionCleansLaunchersWithoutPolicyChange(t *testing.T) {
 	for _, event := range []string{"delete", "update-deleting"} {
 		t.Run(event, func(t *testing.T) {
 			lpp, node, objects := orphanLifecycleObjects(t, true)
-			ctl, cs, _ := newStuckTestControllerWithoutNode(t, stuckTestNow, objects...)
+			ctl, cs, _, _ := newStuckTestControllerWithoutNode(t, stuckTestNow, objects...)
 			progress := observeOrphanReconciles(ctl)
 			if err := ctl.Start(t.Context()); err != nil {
 				t.Fatal(err)
@@ -206,7 +222,7 @@ func TestNodeDeletionCleansLaunchersWithoutPolicyChange(t *testing.T) {
 
 func TestPopulationPolicyDownscaleCleansLaunchers(t *testing.T) {
 	lpp, _, objects := orphanLifecycleObjects(t, true)
-	ctl, cs, _ := newStuckTestControllerWithoutNode(t, stuckTestNow, objects...)
+	ctl, cs, _, _ := newStuckTestControllerWithoutNode(t, stuckTestNow, objects...)
 	progress := observeOrphanReconciles(ctl)
 	if err := ctl.Start(t.Context()); err != nil {
 		t.Fatal(err)
@@ -228,7 +244,7 @@ func TestPopulationPolicyDownscaleCleansLaunchers(t *testing.T) {
 
 func TestStartupCleansLaunchersWithoutNodeOrPolicy(t *testing.T) {
 	orphan := orphanLifecyclePod("orphan", testTemplateHash, false)
-	ctl, cs, _ := newStuckTestControllerWithoutNode(t, stuckTestNow,
+	ctl, cs, _, _ := newStuckTestControllerWithoutNode(t, stuckTestNow,
 		orphan, orphanLifecyclePod("bound", testTemplateHash, true))
 	if err := ctl.Start(t.Context()); err != nil {
 		t.Fatal(err)
@@ -389,9 +405,15 @@ func waitForOrphanPodNames(t *testing.T, cs *k8sfake.Clientset, names ...string)
 
 func assertNoOrphanReplacement(t *testing.T, cs *k8sfake.Clientset) {
 	t.Helper()
-	for _, action := range cs.Actions() {
-		if action.Matches("create", "pods") {
-			t.Error("unexpected replacement launcher creation")
+	checkActions(t, cs.Actions(), []actionAbstract{{"create", "pods"}})
+}
+
+type actionAbstract struct{ Method, Resource string }
+
+func checkActions(t *testing.T, actions []k8stesting.Action, allowed []actionAbstract) {
+	for _, action := range actions {
+		if slices.Index(allowed, actionAbstract{action.GetVerb(), action.GetResource().Resource}) < 0 {
+			t.Errorf("Unexpected action: %v", action)
 		}
 	}
 }

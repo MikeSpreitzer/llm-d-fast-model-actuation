@@ -105,15 +105,7 @@ func podsToObjects(pods []*corev1.Pod) []runtime.Object {
 // stuckLauncherPod builds a launcher Pod in the current namespace with the
 // current template hash.
 func stuckLauncherPod(name string) *corev1.Pod {
-	pod := &corev1.Pod{
-		ObjectMeta: metav1.ObjectMeta{
-			Name:        name,
-			Namespace:   stuckTestNamespace,
-			UID:         types.UID(name + "-uid"),
-			Labels:      map[string]string{common.LauncherConfigNameLabelKey: stuckTestLauncherConfig},
-			Annotations: map[string]string{common.LauncherTemplateHashAnnotationKey: testTemplateHash},
-		},
-	}
+	pod := nodeTemplate(name)
 	pod = utils.SpecializeLauncherTemplateToNode(pod, stuckTestNode)
 	return pod
 }
@@ -161,12 +153,15 @@ func listLaunchers(t *testing.T, cs *k8sfake.Clientset) []*corev1.Pod {
 	return out
 }
 
-func nodeTemplate() *corev1.Pod {
+func nodeTemplate(name string) *corev1.Pod {
 	return &corev1.Pod{
 		ObjectMeta: metav1.ObjectMeta{
-			Name:        "launcher-template",
-			Namespace:   stuckTestNamespace,
-			Labels:      map[string]string{common.LauncherConfigNameLabelKey: stuckTestLauncherConfig},
+			Name:      name,
+			Namespace: stuckTestNamespace,
+			UID:       types.UID(name + "-uid"),
+			Labels: map[string]string{
+				common.ComponentLabelKey:          common.LauncherComponentLabelValue,
+				common.LauncherConfigNameLabelKey: stuckTestLauncherConfig},
 			Annotations: map[string]string{common.LauncherTemplateHashAnnotationKey: testTemplateHash},
 		},
 		Spec: corev1.PodSpec{Containers: []corev1.Container{{Name: api.InferenceServerContainerName, Image: "launcher:test"}}},
@@ -292,7 +287,7 @@ func TestReconcileKeyDownscaleDeletesStuck(t *testing.T) {
 	pod := scheduledNotReadyAt(stuckLauncherPod("launcher-downscale"), stuckTestNow.Add(-10*time.Minute))
 	ctl, cs, _, rec := newStuckTestController(t, stuckTestNow, pod)
 
-	err, _ := ctl.reconcileKey(t.Context(), stuckTestKey(), 0, testTemplateHash, nodeTemplate(), []*corev1.Pod{pod})
+	err, _ := ctl.reconcileKey(t.Context(), stuckTestKey(), 0, testTemplateHash, nodeTemplate("launcher-template"), []*corev1.Pod{pod})
 	if err != nil {
 		t.Fatalf("reconcileKey: %v", err)
 	}
@@ -325,7 +320,7 @@ func TestReconcileKeyDownscaleDeleteConflictDefersStuckReporting(t *testing.T) {
 		)
 	})
 
-	err, requeue := ctl.reconcileKey(t.Context(), stuckTestKey(), 1, testTemplateHash, nodeTemplate(), []*corev1.Pod{healthy, stuck})
+	err, requeue := ctl.reconcileKey(t.Context(), stuckTestKey(), 1, testTemplateHash, nodeTemplate("launcher-template"), []*corev1.Pod{healthy, stuck})
 	if err != nil {
 		t.Fatalf("first reconcileKey: %v", err)
 	}
@@ -346,7 +341,7 @@ func TestReconcileKeyDownscaleDeleteConflictDefersStuckReporting(t *testing.T) {
 		t.Errorf("delete-conflicted Pod must not be reported as stuck in the same reconcile, got %v", events)
 	}
 
-	err, requeue = ctl.reconcileKey(t.Context(), stuckTestKey(), 1, testTemplateHash, nodeTemplate(), listLaunchers(t, cs))
+	err, requeue = ctl.reconcileKey(t.Context(), stuckTestKey(), 1, testTemplateHash, nodeTemplate("launcher-template"), listLaunchers(t, cs))
 	if err != nil {
 		t.Fatalf("second reconcileKey: %v", err)
 	}
@@ -428,7 +423,7 @@ func TestReconcileKeyReportsStuckWithoutReplacement(t *testing.T) {
 	pod := scheduledNotReadyAt(stuckLauncherPod("launcher-stuck"), stuckTestNow.Add(-10*time.Minute))
 	ctl, cs, _, rec := newStuckTestController(t, stuckTestNow, pod)
 
-	err, requeue := ctl.reconcileKey(t.Context(), stuckTestKey(), 1, testTemplateHash, nodeTemplate(), []*corev1.Pod{pod})
+	err, requeue := ctl.reconcileKey(t.Context(), stuckTestKey(), 1, testTemplateHash, nodeTemplate("launcher-template"), []*corev1.Pod{pod})
 	if err != nil {
 		t.Fatalf("reconcileKey: %v", err)
 	}

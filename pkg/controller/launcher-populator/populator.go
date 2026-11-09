@@ -342,13 +342,10 @@ func (ctl *controller) OnDelete(obj any) {
 	}
 }
 
+// Start causes the controller to start doing all its usual stuff.
+// Does not return until all the informer caches have been initialized.
 func (ctl *controller) Start(ctx context.Context) error {
-	ctl.eventBroadcaster.StartRecordingToSink(&coreclient.EventSinkImpl{Interface: ctl.coreclient.Events("")})
-	context.AfterFunc(ctx, func() {
-		ctl.digestQueue.Queue.ShutDown()
-		ctl.keyQueue.Queue.ShutDown()
-		ctl.eventBroadcaster.Shutdown()
-	})
+	ctl.startSansWorkers(ctx)
 	if !cache.WaitForNamedCacheSync(ControllerName, ctx.Done(), ctl.lppInformer.HasSynced, ctl.lcInformer.HasSynced, ctl.podInformer.HasSynced, ctl.nodeInformer.HasSynced) {
 		return fmt.Errorf("caches not synced before end of Start context")
 	}
@@ -357,6 +354,17 @@ func (ctl *controller) Start(ctx context.Context) error {
 	// initial batch and invokes onDigestSyncProcessed when those sentinels are
 	// drained, which is when keyQueue starts its workers.
 	return ctl.digestQueue.StartWorkers(ctx)
+}
+
+// Start causes the controller to start doing all its usual stuff except run workers.
+// Does not wait for the informer caches to be initialized.
+func (ctl *controller) startSansWorkers(ctx context.Context) {
+	ctl.eventBroadcaster.StartRecordingToSink(&coreclient.EventSinkImpl{Interface: ctl.coreclient.Events("")})
+	context.AfterFunc(ctx, func() {
+		ctl.digestQueue.Queue.ShutDown()
+		ctl.keyQueue.Queue.ShutDown()
+		ctl.eventBroadcaster.Shutdown()
+	})
 }
 
 // onDigestSyncProcessed is invoked by KnowsProcessedSync after the initial

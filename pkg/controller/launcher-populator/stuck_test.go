@@ -17,6 +17,7 @@ limitations under the License.
 package launcherpopulator
 
 import (
+	"context"
 	"errors"
 	"strings"
 	"testing"
@@ -27,6 +28,7 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/apimachinery/pkg/util/wait"
 	"k8s.io/client-go/informers"
 	"k8s.io/client-go/kubernetes"
 	k8sfake "k8s.io/client-go/kubernetes/fake"
@@ -53,7 +55,15 @@ const (
 
 var stuckTestNow = time.Date(2026, 6, 21, 12, 0, 0, 0, time.UTC)
 
-func newStuckTestControllerWithoutNode(t *testing.T, now time.Time, objs ...runtime.Object) (*controller, *k8sfake.Clientset, *fmafake.Clientset, *record.FakeRecorder) {
+type controllerActivityLevel int
+
+const (
+	noWorkers controllerActivityLevel = iota
+	digestOnly
+	digestAndKeys
+)
+
+func newStuckTestControllerWithoutNode(t *testing.T, now time.Time, activityLevel controllerActivityLevel, objs ...runtime.Object) (*controller, *k8sfake.Clientset, *fmafake.Clientset, *record.FakeRecorder) {
 	t.Helper()
 	var coreObjects, fmaObjects []runtime.Object
 	for _, obj := range objs {
@@ -84,14 +94,21 @@ func newStuckTestControllerWithoutNode(t *testing.T, now time.Time, objs ...runt
 	coreFactory.Start(t.Context().Done())
 	fmaFactory.Start(t.Context().Done())
 	cs.ClearActions()
-	ctl.noKeyWorkers = true // suppress workers for the key queue
-	ctl.Start(t.Context())
+	switch activityLevel {
+	case noWorkers:
+		ctl.startSansWorkers(t.Context())
+	case digestOnly:
+		ctl.noKeyWorkers = true
+		ctl.Start(t.Context())
+	case digestAndKeys:
+		ctl.Start(t.Context())
+	}
 	return ctl, cs, fmaCS, rec
 }
 
 func newStuckTestController(t *testing.T, now time.Time, objs ...*corev1.Pod) (*controller, *k8sfake.Clientset, *fmafake.Clientset, *record.FakeRecorder) {
 	t.Helper()
-	return newStuckTestControllerWithoutNode(t, now, append(podsToObjects(objs), testNode())...)
+	return newStuckTestControllerWithoutNode(t, now, noWorkers, append(podsToObjects(objs), testNode())...)
 }
 
 func podsToObjects(pods []*corev1.Pod) []runtime.Object {
@@ -105,7 +122,7 @@ func podsToObjects(pods []*corev1.Pod) []runtime.Object {
 // stuckLauncherPod builds a launcher Pod in the current namespace with the
 // current template hash.
 func stuckLauncherPod(name string) *corev1.Pod {
-	pod := nodeTemplate(name)
+	pod := testNodeTemplate(name)
 	pod = utils.SpecializeLauncherTemplateToNode(pod, stuckTestNode)
 	return pod
 }
@@ -153,7 +170,7 @@ func listLaunchers(t *testing.T, cs *k8sfake.Clientset) []*corev1.Pod {
 	return out
 }
 
-func nodeTemplate(name string) *corev1.Pod {
+func testNodeTemplate(name string) *corev1.Pod {
 	return &corev1.Pod{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      name,
@@ -286,8 +303,9 @@ func TestReportStuckLaunchersClearsLabelOnRecovery(t *testing.T) {
 func TestReconcileKeyDownscaleDeletesStuck(t *testing.T) {
 	pod := scheduledNotReadyAt(stuckLauncherPod("launcher-downscale"), stuckTestNow.Add(-10*time.Minute))
 	ctl, cs, _, rec := newStuckTestController(t, stuckTestNow, pod)
+	waitForNodeCached(t, ctl, stuckTestNode)
 
-	err, _ := ctl.reconcileKey(t.Context(), stuckTestKey(), 0, testTemplateHash, nodeTemplate("launcher-template"), []*corev1.Pod{pod})
+	err, _ := ctl.reconcileKey(t.Context(), stuckTestKey(), 0, testTemplateHash, testNodeTemplate("launcher-template"), []*corev1.Pod{pod})
 	if err != nil {
 		t.Fatalf("reconcileKey: %v", err)
 	}
@@ -308,6 +326,7 @@ func TestReconcileKeyDownscaleDeleteConflictDefersStuckReporting(t *testing.T) {
 	healthy := ready(stuckLauncherPod("launcher-healthy"))
 	stuck := scheduledNotReadyAt(stuckLauncherPod("launcher-stuck"), stuckTestNow.Add(-10*time.Minute))
 	ctl, cs, _, rec := newStuckTestController(t, stuckTestNow, healthy, stuck)
+	waitForNodeCached(t, ctl, stuckTestNode)
 	cs.PrependReactor("delete", "pods", func(action k8stesting.Action) (bool, runtime.Object, error) {
 		deleteAction := action.(k8stesting.DeleteAction)
 		if deleteAction.GetName() != stuck.Name {
@@ -320,7 +339,7 @@ func TestReconcileKeyDownscaleDeleteConflictDefersStuckReporting(t *testing.T) {
 		)
 	})
 
-	err, requeue := ctl.reconcileKey(t.Context(), stuckTestKey(), 1, testTemplateHash, nodeTemplate("launcher-template"), []*corev1.Pod{healthy, stuck})
+	err, requeue := ctl.reconcileKey(t.Context(), stuckTestKey(), 1, testTemplateHash, testNodeTemplate("launcher-template"), []*corev1.Pod{healthy, stuck})
 	if err != nil {
 		t.Fatalf("first reconcileKey: %v", err)
 	}
@@ -341,7 +360,7 @@ func TestReconcileKeyDownscaleDeleteConflictDefersStuckReporting(t *testing.T) {
 		t.Errorf("delete-conflicted Pod must not be reported as stuck in the same reconcile, got %v", events)
 	}
 
-	err, requeue = ctl.reconcileKey(t.Context(), stuckTestKey(), 1, testTemplateHash, nodeTemplate("launcher-template"), listLaunchers(t, cs))
+	err, requeue = ctl.reconcileKey(t.Context(), stuckTestKey(), 1, testTemplateHash, testNodeTemplate("launcher-template"), listLaunchers(t, cs))
 	if err != nil {
 		t.Fatalf("second reconcileKey: %v", err)
 	}
@@ -422,8 +441,9 @@ func TestSetStuckLabelIgnoresNotFound(t *testing.T) {
 func TestReconcileKeyReportsStuckWithoutReplacement(t *testing.T) {
 	pod := scheduledNotReadyAt(stuckLauncherPod("launcher-stuck"), stuckTestNow.Add(-10*time.Minute))
 	ctl, cs, _, rec := newStuckTestController(t, stuckTestNow, pod)
+	waitForNodeCached(t, ctl, stuckTestNode)
 
-	err, requeue := ctl.reconcileKey(t.Context(), stuckTestKey(), 1, testTemplateHash, nodeTemplate("launcher-template"), []*corev1.Pod{pod})
+	err, requeue := ctl.reconcileKey(t.Context(), stuckTestKey(), 1, testTemplateHash, testNodeTemplate("launcher-template"), []*corev1.Pod{pod})
 	if err != nil {
 		t.Fatalf("reconcileKey: %v", err)
 	}
@@ -474,5 +494,22 @@ func TestReportStuckLaunchersPropagatesLabelPatchError(t *testing.T) {
 				t.Errorf("expected the label Patch error to propagate")
 			}
 		})
+	}
+}
+
+func waitForNodeCached(t *testing.T, ctl *controller, nodeName string) {
+	if err := wait.PollUntilContextTimeout(t.Context(), 250*time.Millisecond, 5*time.Second, true, func(ctx context.Context) (bool, error) {
+		node, err := ctl.nodeLister.Get(nodeName)
+		if err != nil {
+			t.Logf("failed to get Node %s from cache: %v", nodeName, err)
+			return false, nil
+		}
+		if node == nil {
+			t.Logf("failed to get Node %s from cache: got nil instead", nodeName)
+			return false, nil
+		}
+		return true, nil
+	}); err != nil {
+		t.Fatalf("waiting for Node %v: %v", nodeName, err)
 	}
 }
